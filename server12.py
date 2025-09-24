@@ -6,7 +6,7 @@ from collections import deque
 from typing import List, Optional, Dict, Any, Optional, TYPE_CHECKING, TypeVar
 import logging as log
 
-# For type hints
+# For type hints 
 #TTSController = TypeVar('TTSController') 
 
 import numpy as np, torch, whisper, boto3
