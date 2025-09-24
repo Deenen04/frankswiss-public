@@ -86,17 +86,19 @@ LABEL2ID = {lab: i for i, lab in enumerate(INTENT_LABELS)}
 
 INTENT_MAXLEN = int(os.getenv("INTENT_MAXLEN", "256"))
 
-# --------- IMPROVED PROMPT ----------
+# --------- SLOT-FILLING ORCHESTRATOR PROMPT ----------
 SYSTEM_PROMPT = """
-You are an automated medical receptionist. Your goal is maximum efficiency. 
-RULES:
-"1. Respond ONLY in the user's language. "
-"2. Be extremely concise. Get straight to the point. No filler words or polite chatter like 'I can help with that.' "
-"3. MAXIMUM response length is {RESP_MAX_WORDS} words. SHORTER IS BETTER. "
-"4. For appointments: if purpose or name is missing, ask for them succinctly; otherwise answer and proceed to schedule. "
-"5. NEVER use lists or numbered steps in your response. "
-"6. Your function is to provide information or book appointments as fast as possible."
-"7. When mentioning times or any quantities, write them out in words and avoid digits entirely (no numbers). "
+You are a calm, efficient medical receptionist.
+Principles:
+- Understand what the caller already said. NEVER ask for info they already provided.
+- Fill missing details ONE at a time with a short, natural question.
+- When enough info is gathered, give a brief confirmation (one or two sentences), then proceed.
+- Be concise. Avoid filler. No lists or numbered steps.
+- When mentioning times or small numbers, write them in words.
+- If the user asks broad medical info, stay general and invite booking; no diagnosis or dosing.
+- Safety first: emergencies → tell them to call the emergency line.
+- MAXIMUM response length is {RESP_MAX_WORDS} words. SHORTER IS BETTER.
+- Respond ONLY in the user's language.
 """
 
 def SYS():
@@ -266,6 +268,9 @@ class TurnManager:
         self.prescription_state = None
         # Generic phone request flag to avoid repeating question
         self.phone_pending = False
+        # Slot-filling orchestrator state
+        self.slots: Dict[str, Any] = {}
+        self.intent: Optional[str] = None
 
     def allow_user_turn(self) -> bool: return self.user_turn
     def start_bot_turn(self): self.user_turn = False
@@ -367,6 +372,405 @@ def caller(ws)->str:
     if num: return num
     q=urlparse(getattr(ws,"path","")).query
     return parse_qs(q).get("From",["?"])[0]
+
+# ------------------- SLOT DETECTION FUNCTIONS -------------------
+
+def detect_appointment_type(text: str, history: str = "") -> Optional[tuple[str, int]]:
+    """Detect appointment type and return (type, duration_minutes)."""
+    combined = f"{history} {text}".lower()
+    
+    # Map variations to canonical types with durations
+    type_patterns = {
+        "first_consultation": (r"\b(first\s+(consultation|visit|appointment)|new\s+patient|initial\s+(consultation|visit))\b", 40),
+        "follow_up": (r"\b(follow\s*up|control\s+(visit|appointment)|review|check\s*up|revisit)\b", 20),
+        "iron_infusion": (r"\b(iron\s*(infusion|fusion|infus)|infusion\s*iron)\b", 20),
+        "pragmafare": (r"\bpragmafare\b", 30),
+        "other_scheduling": (r"\b(other|general|regular|standard|normal)\s*(scheduling|appointment)\b", 20)
+    }
+    
+    for apt_type, (pattern, duration) in type_patterns.items():
+        if re.search(pattern, combined):
+            return apt_type, duration
+    
+    return None
+
+def detect_time_and_window(text: str) -> Dict[str, Any]:
+    """Detect time preferences, weekdays, and relative windows."""
+    result = {}
+    text_lower = text.lower()
+    
+    # Specific time patterns (24h format)
+    time_patterns = [
+        r"\b(\d{1,2}):(\d{2})\b",
+        r"\b(\d{1,2})\s*(am|pm)\b",
+        r"\b(eight|nine|ten|eleven|twelve|one|two|three|four|five|six|seven)\s*(am|pm|o'?clock)\b"
+    ]
+    
+    for pattern in time_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            # Simple conversion for common times
+            time_words = {
+                "eight": "08:00", "nine": "09:00", "ten": "10:00", "eleven": "11:00",
+                "twelve": "12:00", "one": "13:00", "two": "14:00", "three": "15:00",
+                "four": "16:00", "five": "17:00", "six": "18:00", "seven": "19:00"
+            }
+            if match.group(1) in time_words:
+                result["time_24h"] = time_words[match.group(1)]
+            break
+    
+    # Time preferences
+    if re.search(r"\bmorning\b", text_lower):
+        result["time_pref"] = "morning"
+    elif re.search(r"\bafternoon\b", text_lower):
+        result["time_pref"] = "afternoon"
+    elif re.search(r"\bevening\b", text_lower):
+        result["time_pref"] = "evening"
+    
+    # Weekdays
+    weekday_patterns = {
+        "monday": r"\bmonday\b", "tuesday": r"\btuesday\b", "wednesday": r"\bwednesday\b",
+        "thursday": r"\bthursday\b", "friday": r"\bfriday\b", "saturday": r"\bsaturday\b",
+        "sunday": r"\bsunday\b"
+    }
+    
+    for day, pattern in weekday_patterns.items():
+        if re.search(pattern, text_lower):
+            result["day_of_week"] = day.capitalize()
+            break
+    
+    # Relative windows
+    if re.search(r"\bnext\s+week\b", text_lower):
+        result["next_week_flag"] = True
+    elif re.search(r"\bthis\s+week\b", text_lower):
+        result["this_week_flag"] = True
+    elif re.search(r"\btoday\b", text_lower):
+        result["today_flag"] = True
+    elif re.search(r"\btomorrow\b", text_lower):
+        result["tomorrow_flag"] = True
+    
+    return result
+
+def detect_date_iso(text: str, lang: str = "en") -> Optional[str]:
+    """Detect and convert dates to ISO format."""
+    from datetime import datetime, timedelta
+    
+    text_lower = text.lower()
+    now = datetime.now()
+    
+    # Direct date patterns (DD/MM/YYYY, DD-MM-YYYY, etc.)
+    date_patterns = [
+        r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b",
+        r"\b(\d{4})[/-](\d{1,2})[/-](\d{1,2})\b"
+    ]
+    
+    for pattern in date_patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                if len(match.group(1)) == 4:  # YYYY-MM-DD format
+                    return f"{match.group(1)}-{match.group(2):0>2}-{match.group(3):0>2}"
+                else:  # DD/MM/YYYY format
+                    return f"{match.group(3)}-{match.group(2):0>2}-{match.group(1):0>2}"
+            except:
+                pass
+    
+    # Weekday conversion using existing logic
+    time_window = detect_time_and_window(text)
+    if time_window.get("day_of_week"):
+        weekday_name = time_window["day_of_week"].lower()
+        weekday_idx = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"].index(weekday_name)
+        
+        today_idx = now.weekday()
+        delta = (weekday_idx - today_idx) % 7
+        
+        if delta == 0 and not time_window.get("today_flag"):
+            delta = 7  # Next week if same day but not explicitly "today"
+        
+        target_date = now.date() + timedelta(days=delta)
+        return target_date.strftime("%Y-%m-%d")
+    
+    return None
+
+def detect_patient_status(text: str, history: str = "") -> Optional[str]:
+    """Detect if patient is new or existing."""
+    combined = f"{history} {text}".lower()
+    
+    if re.search(r"\b(first\s+(consultation|visit|appointment)|new\s+patient|never\s+been|first\s+time)\b", combined):
+        return "new"
+    elif re.search(r"\b(follow\s*up|return|existing|regular|been\s+before|last\s+time)\b", combined):
+        return "existing"
+    
+    return None
+
+def detect_name(text: str, history: str = "") -> Optional[str]:
+    """Extract patient name from text or history."""
+    # Try the existing LLM extraction first
+    extracted = _extract_name_from_text(text, history, "en")
+    if extracted:
+        return extracted
+    
+    # Simple regex fallback for common patterns
+    name_patterns = [
+        r"\bi'?m\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\b",
+        r"\bmy\s+name\s+is\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\b",
+        r"\bthis\s+is\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\b"
+    ]
+    
+    for pattern in name_patterns:
+        match = re.search(pattern, text.lower())
+        if match:
+            return match.group(1).title()
+    
+    return None
+
+def detect_phone(text: str) -> Optional[str]:
+    """Extract phone number from text."""
+    return extract_phone_from_text(text)
+
+def detect_previous_appointment(text: str) -> Dict[str, Any]:
+    """Detect references to existing appointments for reschedule/cancel."""
+    result = {}
+    
+    # Look for date references
+    prev_date = detect_date_iso(text)
+    if prev_date:
+        result["prev_date_iso"] = prev_date
+    
+    # Look for time references  
+    time_info = detect_time_and_window(text)
+    if time_info.get("time_24h"):
+        result["prev_time_24h"] = time_info["time_24h"]
+    
+    # Look for "the only" or "my" appointment
+    if re.search(r"\b(the\s+only|my\s+only|my\s+appointment)\b", text.lower()):
+        result["single_appointment"] = True
+    
+    return result
+
+# ------------------- SLOT SCHEMAS AND ORCHESTRATOR -------------------
+
+SLOT_SCHEMAS = {
+    "appointment_booking": [
+        "appointment_type", "date_iso", "time_24h", "time_pref", 
+        "patient_status", "patient_name", "phone_number"
+    ],
+    "appointment_reschedule": [
+        "prev_date_iso", "prev_time_24h", "new_date_iso", "new_time_24h", 
+        "time_pref", "appointment_type", "patient_name", "phone_number"
+    ],
+    "appointment_cancellation": [
+        "prev_date_iso", "prev_time_24h", "patient_name", "phone_number"
+    ],
+    "prescription_renewal": [
+        "patient_name", "phone_number"
+    ],
+    "callback_request": [
+        "phone_number"
+    ]
+}
+
+SLOT_PRIORITY = {
+    "appointment_booking": ["appointment_type", "date_iso", "time_pref", "patient_status", "patient_name", "phone_number"],
+    "appointment_reschedule": ["prev_date_iso", "new_date_iso", "time_pref", "patient_name", "phone_number"],
+    "appointment_cancellation": ["prev_date_iso", "patient_name", "phone_number"],
+    "prescription_renewal": ["patient_name", "phone_number"],
+    "callback_request": ["phone_number"]
+}
+
+def extract_all_slots(user_text: str, history: str, lang: str) -> Dict[str, Any]:
+    """Extract all possible slots from current text and history."""
+    slots = {}
+    
+    # Appointment type
+    apt_type_result = detect_appointment_type(user_text, history)
+    if apt_type_result:
+        slots["appointment_type"] = apt_type_result[0]
+        slots["duration_minutes"] = apt_type_result[1]
+    
+    # Time and date information
+    time_info = detect_time_and_window(user_text)
+    if time_info.get("time_24h"):
+        slots["time_24h"] = time_info["time_24h"]
+    if time_info.get("time_pref"):
+        slots["time_pref"] = time_info["time_pref"]
+    if time_info.get("day_of_week"):
+        slots["day_of_week"] = time_info["day_of_week"]
+    
+    # Date detection
+    date_iso = detect_date_iso(user_text, lang)
+    if date_iso:
+        slots["date_iso"] = date_iso
+        # Also try to set new_date_iso for reschedule scenarios
+        slots["new_date_iso"] = date_iso
+    
+    # Patient status
+    patient_status = detect_patient_status(user_text, history)
+    if patient_status:
+        slots["patient_status"] = patient_status
+    
+    # Name and phone
+    name = detect_name(user_text, history)
+    if name:
+        slots["patient_name"] = name
+    
+    phone = detect_phone(user_text)
+    if phone:
+        slots["phone_number"] = phone
+    
+    # Previous appointment info for reschedule/cancel
+    prev_apt = detect_previous_appointment(user_text)
+    if prev_apt:
+        slots.update(prev_apt)
+    
+    return slots
+
+def get_missing_slots(intent: str, current_slots: Dict[str, Any]) -> List[str]:
+    """Get list of missing required slots for the intent."""
+    required = SLOT_SCHEMAS.get(intent, [])
+    missing = []
+    
+    for slot in required:
+        # Special logic for alternative slots
+        if slot == "date_iso" and current_slots.get("day_of_week"):
+            continue  # day_of_week can substitute for date_iso
+        elif slot == "time_24h" and current_slots.get("time_pref"):
+            continue  # time_pref can substitute for specific time
+        elif slot == "new_date_iso" and current_slots.get("date_iso"):
+            continue  # date_iso can be used as new_date_iso
+        elif slot == "prev_date_iso" and current_slots.get("single_appointment"):
+            continue  # single appointment doesn't need specific date
+        elif not current_slots.get(slot):
+            missing.append(slot)
+    
+    return missing
+
+def generate_slot_question(missing_slot: str, lang: str, current_slots: Dict[str, Any]) -> str:
+    """Generate a natural question for the missing slot."""
+    questions = {
+        "appointment_type": {
+            "en": "What type of appointment do you need?",
+            "fr": "Quel type de rendez-vous souhaitez-vous ?",
+            "de": "Welche Art von Termin benötigen Sie?",
+            "it": "Che tipo di appuntamento ti serve?"
+        },
+        "date_iso": {
+            "en": "Which day works best for you?",
+            "fr": "Quel jour vous convient le mieux ?",
+            "de": "Welcher Tag passt Ihnen am besten?",
+            "it": "Quale giorno va meglio per te?"
+        },
+        "time_pref": {
+            "en": "Do you prefer morning, afternoon, or evening?",
+            "fr": "Préférez-vous le matin, l'après-midi ou le soir ?",
+            "de": "Bevorzugen Sie morgens, nachmittags oder abends?",
+            "it": "Preferisci mattina, pomeriggio o sera?"
+        },
+        "patient_name": {
+            "en": "What's your name?",
+            "fr": "Quel est votre nom ?",
+            "de": "Wie ist Ihr Name?",
+            "it": "Come ti chiami?"
+        },
+        "phone_number": {
+            "en": "What's your phone number?",
+            "fr": "Quel est votre numéro de téléphone ?",
+            "de": "Wie ist Ihre Telefonnummer?",
+            "it": "Qual è il tuo numero di telefono?"
+        },
+        "prev_date_iso": {
+            "en": "Which appointment would you like to change?",
+            "fr": "Quel rendez-vous souhaitez-vous modifier ?",
+            "de": "Welchen Termin möchten Sie ändern?",
+            "it": "Quale appuntamento vuoi cambiare?"
+        },
+        "new_date_iso": {
+            "en": "What's your preferred new date?",
+            "fr": "Quelle nouvelle date préférez-vous ?",
+            "de": "Welches neue Datum bevorzugen Sie?",
+            "it": "Quale nuova data preferisci?"
+        }
+    }
+    
+    lang_key = lang[:2] if lang else "en"
+    return questions.get(missing_slot, {}).get(lang_key, questions[missing_slot]["en"])
+
+def generate_confirmation(intent: str, slots: Dict[str, Any], lang: str) -> str:
+    """Generate confirmation message when all slots are filled."""
+    confirmations = {
+        "appointment_booking": {
+            "en": "Perfect! I'll book your {type} for {day}. Your name and phone number?",
+            "fr": "Parfait ! Je réserve votre {type} pour {day}. Votre nom et numéro ?",
+            "de": "Perfekt! Ich buche Ihren {type} für {day}. Ihr Name und Telefonnummer?",
+            "it": "Perfetto! Prenoto il tuo {type} per {day}. Nome e numero di telefono?"
+        },
+        "appointment_reschedule": {
+            "en": "I'll reschedule your appointment to {day}. Confirming with your details.",
+            "fr": "Je reporte votre rendez-vous à {day}. Confirmation avec vos coordonnées.",
+            "de": "Ich verschiebe Ihren Termin auf {day}. Bestätigung mit Ihren Daten.",
+            "it": "Sposto il tuo appuntamento a {day}. Confermo con i tuoi dati."
+        },
+        "appointment_cancellation": {
+            "en": "I'll cancel your appointment. Just need to confirm your details.",
+            "fr": "J'annule votre rendez-vous. Juste besoin de confirmer vos coordonnées.",
+            "de": "Ich storniere Ihren Termin. Ich muss nur Ihre Daten bestätigen.",
+            "it": "Annullo il tuo appuntamento. Devo solo confermare i tuoi dati."
+        },
+        "prescription_renewal": {
+            "en": "I'll request your prescription renewal. The doctor will contact you soon.",
+            "fr": "Je demande le renouvellement de votre ordonnance. Le médecin vous contactera bientôt.",
+            "de": "Ich beantrage die Erneuerung Ihres Rezepts. Der Arzt wird Sie bald kontaktieren.",
+            "it": "Richiedo il rinnovo della tua prescrizione. Il medico ti contatterà presto."
+        },
+        "callback_request": {
+            "en": "I'll arrange for someone to call you back as soon as possible.",
+            "fr": "Je vais organiser pour que quelqu'un vous rappelle dès que possible.",
+            "de": "Ich werde dafür sorgen, dass Sie so schnell wie möglich zurückgerufen werden.",
+            "it": "Organizzerò perché qualcuno ti richiami il prima possibile."
+        }
+    }
+    
+    lang_key = lang[:2] if lang else "en"
+    template = confirmations.get(intent, {}).get(lang_key, confirmations[intent]["en"])
+    
+    # Simple template substitution
+    day_info = slots.get("day_of_week", "").lower()
+    apt_type = slots.get("appointment_type", "appointment").replace("_", " ")
+    
+    return template.format(type=apt_type, day=day_info)
+
+def build_orchestrated_reply(label: str, user_text: str, history: str, lang: str, sess) -> str:
+    """Main orchestrator function for slot-filling conversations."""
+    
+    # Set intent if not already set
+    if not sess.turns.intent:
+        sess.turns.intent = label
+    
+    # Extract new slots from current turn
+    new_slots = extract_all_slots(user_text, history, lang)
+    
+    # Merge with existing slots (don't overwrite non-empty values)
+    for key, value in new_slots.items():
+        if value and not sess.turns.slots.get(key):
+            sess.turns.slots[key] = value
+    
+    # Get missing slots
+    missing = get_missing_slots(label, sess.turns.slots)
+    
+    if missing:
+        # Ask for the next missing slot based on priority
+        priority_order = SLOT_PRIORITY.get(label, missing)
+        next_missing = None
+        for slot in priority_order:
+            if slot in missing:
+                next_missing = slot
+                break
+        
+        if next_missing:
+            return generate_slot_question(next_missing, lang, sess.turns.slots)
+    
+    # All required slots filled - generate confirmation
+    return generate_confirmation(label, sess.turns.slots, lang)
 
 # ------------------- ElevenLabs synth -------------------
 def synthesize_polly_pcm(text:str, lang:str):
@@ -766,51 +1170,31 @@ def build_medical_reply(user_text:str, history:str, lang:str) -> str:
         reply = truncate_words(f"{boundary} {reply}", RESP_MAX_WORDS)
     return reply
 
-def build_appointment_reply(user_text:str, history:str, lang:str) -> str:
+def build_appointment_reply(user_text:str, history:str, lang:str, sess=None) -> str:
+    """Wrapper for appointment booking - now uses orchestrator."""
+    if sess:
+        return truncate_words(build_orchestrated_reply("appointment_booking", user_text, history, lang, sess), max_words=RESP_MAX_WORDS)
+    
+    # Fallback to simplified prompt if no session
     prompt = (
-        f"{SYSTEM_PROMPT}\n"
-        f"You are a friendly medical receptionist. Follow this EXACT conversational flow:\n"
-        f"1. FIRST: Ask 'Hi! What would you like to do today—schedule, reschedule, or cancel an appointment?' if they haven't specified the purpose\n"
-        f"2. SECOND: Ask for the PURPOSE of their visit. Say 'What type of appointment do you need?' and offer these options:\n"
-        f"   - First consultation (forty minutes)\n"
-        f"   - Follow up (twenty minutes)\n"
-        f"   - Iron infusion (twenty minutes)\n"
-        f"   - Pragmafare (thirty minutes)\n"
-        f"   - Other scheduling (twenty minutes)\n"
-        f"3. THIRD: Once you know the type, offer specific available times like 'Great! I have availability on Tuesday at three PM or Thursday at eleven AM. Which works best for you?'\n"
-        f"4. FOURTH: After they confirm a date/time, say 'Perfect, I've reserved that slot. Can I have your name and phone number so we can confirm your appointment?'\n"
-        f"5. FIFTH: End with a summary like 'Thanks, [Name]! Your [appointment type] has been scheduled for Thursday at eleven AM.'\n"
-        f"- Be warm and natural, use the exact examples provided\n"
-        f"- Only move to next step when you have current information\n"
-        f"- Keep under {RESP_MAX_WORDS} words\n"
-        f"- Write times in words, no digits\n"
-        f"- DO NOT mention reminders or confirmations\n"
+        f"{SYS()}\n"
+        f"Help with appointment booking. Ask for missing details one at a time.\n"
         f"CONVERSATION HISTORY:\n{history or '(no prior turns)'}\n\n"
         f"USER: {user_text}\n"
         f"ASSISTANT:"
     )
     return truncate_words(clean_reply(llama(prompt, lang)), max_words=RESP_MAX_WORDS)
 
-def build_reschedule_reply(user_text: str, history: str, lang: str, state: Optional[str], prev_date: Optional[str], prev_time: Optional[str]) -> tuple[str, str]:
-    """Follow flow: purpose → appointment type → dates → confirmation → name+phone → summary"""
+def build_reschedule_reply(user_text: str, history: str, lang: str, state: Optional[str], prev_date: Optional[str], prev_time: Optional[str], sess=None) -> tuple[str, str]:
+    """Wrapper for appointment rescheduling - now uses orchestrator."""
+    if sess:
+        reply = truncate_words(build_orchestrated_reply("appointment_reschedule", user_text, history, lang, sess), max_words=RESP_MAX_WORDS)
+        return reply, 'completed'
     
+    # Fallback to simplified prompt if no session
     prompt = (
-        f"{SYSTEM_PROMPT}\n"
-        f"You are helping with appointment rescheduling. Follow this EXACT conversational flow:\n"
-        f"1. FIRST: Ask 'Hi! What would you like to do today—schedule, reschedule, or cancel an appointment?' if purpose unclear, or ask which appointment they want to reschedule\n"
-        f"2. SECOND: Ask for the PURPOSE of their visit. Say 'What type of appointment do you need?' and offer these options:\n"
-        f"   - First consultation (forty minutes)\n"
-        f"   - Follow up (twenty minutes)\n"
-        f"   - Iron infusion (twenty minutes)\n"
-        f"   - Pragmafare (thirty minutes)\n"
-        f"   - Other scheduling (twenty minutes)\n"
-        f"3. THIRD: Once you know the type, offer new times like 'Great! I have availability on Tuesday at three PM or Thursday at eleven AM. Which works best for you?'\n"
-        f"4. FOURTH: After they confirm new date/time, say 'Perfect, I've reserved that new slot. Can I have your name and phone number to confirm the change?'\n"
-        f"5. FIFTH: End with summary like 'Thanks, [Name]! Your [appointment type] has been rescheduled for Thursday at eleven AM.'\n"
-        f"- Be warm and natural, use the exact flow pattern\n"
-        f"- Keep under {RESP_MAX_WORDS} words\n"
-        f"- Write times in words, no digits\n"
-        f"- DO NOT mention reminders or confirmations\n"
+        f"{SYS()}\n"
+        f"Help with appointment rescheduling. Ask for missing details one at a time.\n"
         f"CONVERSATION HISTORY:\n{history or '(no prior turns)'}\n\n"
         f"USER: {user_text}\n"
         f"ASSISTANT:"
@@ -819,19 +1203,16 @@ def build_reschedule_reply(user_text: str, history: str, lang: str, state: Optio
     reply = truncate_words(clean_reply(llama(prompt, lang)), max_words=RESP_MAX_WORDS)
     return reply, 'completed'
 
-def build_cancellation_reply(user_text: str, history: str, lang: str, state: Optional[str]) -> tuple[str, str]:
-    """Follow same flow pattern: purpose → confirmation → name+phone → summary"""
+def build_cancellation_reply(user_text: str, history: str, lang: str, state: Optional[str], sess=None) -> tuple[str, str]:
+    """Wrapper for appointment cancellation - now uses orchestrator."""
+    if sess:
+        reply = truncate_words(build_orchestrated_reply("appointment_cancellation", user_text, history, lang, sess), max_words=RESP_MAX_WORDS)
+        return reply, 'completed'
     
+    # Fallback to simplified prompt if no session
     prompt = (
-        f"{SYSTEM_PROMPT}\n"
-        f"You are helping with appointment cancellation. Follow this EXACT conversational flow:\n"
-        f"1. FIRST: Ask 'Hi! What would you like to do today—schedule, reschedule, or cancel an appointment?' if purpose unclear, or ask which appointment they want to cancel\n"
-        f"2. SECOND: Once you know what they're canceling, confirm the details\n"
-        f"3. THIRD: Say 'I can help with that cancellation. Can I have your name and phone number to confirm?'\n"
-        f"4. FOURTH: End with summary like 'Thanks, [Name]! Your appointment has been cancelled.'\n"
-        f"- Be warm and natural, follow the exact flow pattern\n"
-        f"- Keep under {RESP_MAX_WORDS} words\n"
-        f"- Write times in words, no digits\n"
+        f"{SYS()}\n"
+        f"Help with appointment cancellation. Ask for missing details one at a time.\n"
         f"CONVERSATION HISTORY:\n{history or '(no prior turns)'}\n\n"
         f"USER: {user_text}\n"
         f"ASSISTANT:"
@@ -860,29 +1241,26 @@ def _extract_name_from_text(user_text: str, history: str, lang: str) -> Optional
     except Exception:
         return None
 
-def build_prescription_renewal_reply(user_text: str, history: str, lang: str, state: Optional[str]) -> tuple[str, str, Optional[str]]:
+def build_prescription_renewal_reply(user_text: str, history: str, lang: str, state: Optional[str], sess=None) -> tuple[str, str, Optional[str]]:
     """
-    Prescription renewal flow: purpose → confirm → name+phone → summary
+    Wrapper for prescription renewal - now uses orchestrator.
     Returns (reply, next_state, extracted_name)
     """
+    if sess:
+        reply = truncate_words(build_orchestrated_reply("prescription_renewal", user_text, history, lang, sess), max_words=RESP_MAX_WORDS)
+        name = sess.turns.slots.get("patient_name")
+        return reply, 'completed', name
+    
+    # Fallback to simplified prompt if no session
     prompt = (
-        f"{SYSTEM_PROMPT}\n"
-        f"You are helping with prescription renewal. Follow this EXACT conversational flow:\n"
-        f"1. FIRST: If purpose unclear, ask what they need help with\n"
-        f"2. SECOND: Once you know they need prescription renewal, say 'I can definitely help with that renewal.'\n"
-        f"3. THIRD: Ask 'Can I have your name and phone number so the doctor can follow up with you?'\n"
-        f"4. FOURTH: End with 'Thanks, [Name]! I've noted your prescription renewal request. The doctor will contact you at [Phone Number] soon.'\n"
-        f"- Be warm and natural, follow the exact flow pattern\n"
-        f"- Keep under {RESP_MAX_WORDS} words\n"
-        f"- No digits in responses\n"
+        f"{SYS()}\n"
+        f"Help with prescription renewal. Ask for missing details one at a time.\n"
         f"CONVERSATION HISTORY:\n{history or '(no prior turns)'}\n\n"
         f"USER: {user_text}\n"
         f"ASSISTANT:"
     )
     
     reply = truncate_words(clean_reply(llama(prompt, lang)), max_words=RESP_MAX_WORDS)
-    
-    # Try to extract name if provided in this turn
     name = _extract_name_from_text(user_text, history, lang)
     
     return reply, 'completed', name
@@ -1231,11 +1609,15 @@ def store_cancellation(stream_sid: str, phone_number: str, conversation_history:
         print(f"Error storing appointment booking: {e}")
         return False
 
-def build_callback_reply(user_text: str, history: str, lang: str, callback_state: str = None) -> tuple[str, str]:
+def build_callback_reply(user_text: str, history: str, lang: str, callback_state: str = None, sess=None) -> tuple[str, str]:
     """
-    Build callback flow responses using AI.
+    Build callback flow responses using orchestrator when possible.
     Returns tuple of (reply, next_callback_state)
     """
+    # If we have a session and this is the initial callback request, use orchestrator
+    if sess and callback_state is None:
+        reply = truncate_words(build_orchestrated_reply("callback_request", user_text, history, lang, sess), max_words=RESP_MAX_WORDS)
+        return reply, 'completed'
     if callback_state is None:
         # Initial callback request - check availability
         availability_prompt = (
@@ -1608,7 +1990,7 @@ async def process_segment(ws, sid, res, sess):
         emit("rag", hits=hits)
 
     elif reply is None and label == "appointment_booking":
-        reply = build_appointment_reply(text, history, lang)    # NO VKG
+        reply = build_appointment_reply(text, history, lang, sess)    # Now uses orchestrator
         try:
             # Mark that appointment booking occurred in this session
             sess.turns.appointment_detected = True
@@ -1616,39 +1998,21 @@ async def process_segment(ws, sid, res, sess):
             pass
 
     elif reply is None and label == "callback_request":
-        # Handle callback request conversationally; storage deferred to end of session
-        phone_pattern = re.compile(r'[\d\s\-\(\)\.+]{7,}')
-        phone_match = phone_pattern.search(text)
-        if phone_match:
-            confirm_msgs = {
-                "en": "Got it. I recorded your callback request. We'll call you back as soon as possible.",
-                "fr": "Parfait. J'ai enregistré votre demande de rappel. On vous rappellera dès que possible.",
-                "de": "Verstanden. Ich habe Ihren Rückruf gespeichert. Wir melden uns so schnell wie möglich.",
-                "it": "Perfetto. Ho registrato la tua richiesta di richiamata. Ti richiameremo il prima possibile."
-            }
-            reply = confirm_msgs.get(lang[:2], confirm_msgs["en"])
-            sess.turns.callback_state = 'completed'
-        else:
-            ask_phone = {
-                "en": "I recorded your callback request. What's the best phone number to reach you?",
-                "fr": "J'ai enregistré votre demande de rappel. Quel est le meilleur numéro pour vous joindre ?",
-                "de": "Ich habe Ihre Rückruf-Anfrage gespeichert. Unter welcher Nummer erreichen wir Sie am besten?",
-                "it": "Ho registrato la tua richiesta di richiamata. Qual è il numero migliore per contattarti?"
-            }
-            reply = ask_phone.get(lang[:2], ask_phone["en"])
-            sess.turns.callback_state = 'waiting_phone'
+        # Handle callback request using orchestrator; storage deferred to end of session
+        reply, new_callback_state = build_callback_reply(text, history, lang, sess.turns.callback_state, sess)
+        sess.turns.callback_state = new_callback_state
 
     elif reply is None and label == "appointment_reschedule":
-        # Simple reschedule handling
-        reply, _ = build_reschedule_reply(text, history, lang, None, None, None)
+        # Simple reschedule handling using orchestrator
+        reply, _ = build_reschedule_reply(text, history, lang, None, None, None, sess)
 
     elif reply is None and label == "appointment_cancellation":
-        # Simple cancellation handling
-        reply, _ = build_cancellation_reply(text, history, lang, None)
+        # Simple cancellation handling using orchestrator
+        reply, _ = build_cancellation_reply(text, history, lang, None, sess)
 
     elif reply is None and label == "speak_to_someone":
         # Availability flow → then offer callback; manage state only, storage deferred
-        reply, new_callback_state = build_callback_reply(text, history, lang, sess.turns.callback_state)
+        reply, new_callback_state = build_callback_reply(text, history, lang, sess.turns.callback_state, sess)
         sess.turns.callback_state = new_callback_state
         if new_callback_state == 'completed':
             # No immediate storage here; unified storage at session end
@@ -1668,8 +2032,8 @@ async def process_segment(ws, sid, res, sess):
         reply = quick_replies["rude"].get(lang)
 
     elif reply is None and label == "prescription_renewal":
-        # Handle prescription renewal flow
-        pr_reply, new_state, extracted_name = build_prescription_renewal_reply(text, history, lang, sess.turns.prescription_state)
+        # Handle prescription renewal flow using orchestrator
+        pr_reply, new_state, extracted_name = build_prescription_renewal_reply(text, history, lang, sess.turns.prescription_state, sess)
         reply = pr_reply
         sess.turns.prescription_state = new_state
         if new_state == 'completed' or extracted_name:
@@ -1689,7 +2053,7 @@ async def process_segment(ws, sid, res, sess):
 
     # Handle callback state responses even if not classified as callback_request
     elif reply is None and sess.turns.callback_state in ['offered', 'waiting_phone']:
-        reply, new_callback_state = build_callback_reply(text, history, lang, sess.turns.callback_state)
+        reply, new_callback_state = build_callback_reply(text, history, lang, sess.turns.callback_state, sess)
         sess.turns.callback_state = new_callback_state
         
         # If callback is completed, do not store immediately (defer to session end)
@@ -1698,7 +2062,7 @@ async def process_segment(ws, sid, res, sess):
 
     # Handle prescription renewal state even if not classified
     elif reply is None and sess.turns.prescription_state in ['waiting_name']:
-        pr_reply, new_state, extracted_name = build_prescription_renewal_reply(text, history, lang, sess.turns.prescription_state)
+        pr_reply, new_state, extracted_name = build_prescription_renewal_reply(text, history, lang, sess.turns.prescription_state, sess)
         reply = pr_reply
         sess.turns.prescription_state = new_state
 
@@ -1751,5 +2115,6 @@ async def main():
 if __name__ == "__main__":
 
     asyncio.run(main())
+
 
 
